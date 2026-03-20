@@ -2,103 +2,105 @@ import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, db
 import pandas as pd
-import time
+import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
 
-# =====================================================
-# LOGIN SYSTEM
-# =====================================================
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="DHT11 Dashboard",
+    page_icon="🌡️",
+    layout="wide"
+)
 
+# ── Session state (login) ─────────────────────────────────────────────────────
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
-if not st.session_state.logged_in:
-
-    st.set_page_config(page_title="Login", layout="centered")
-    st.title("🔐 Gas Dashboard Login")
-
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-
+def login():
+    st.title("🔐 DHT11 Dashboard Login")
+    user = st.text_input("Username")
+    pwd  = st.text_input("Password", type="password")
     if st.button("Login"):
-
-        if (
-            username == st.secrets["auth"]["username"]
-            and password == st.secrets["auth"]["password"]
-        ):
+        if (user == st.secrets["auth"]["username"] and
+                pwd == st.secrets["auth"]["password"]):
             st.session_state.logged_in = True
             st.rerun()
         else:
-            st.error("Wrong username or password")
+            st.error("Invalid credentials. Please try again.")
 
+if not st.session_state.logged_in:
+    login()
     st.stop()
 
-# =====================================================
-# FIREBASE INITIALIZATION
-# =====================================================
-
-firebase_config = dict(st.secrets["firebase"])
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate(firebase_config)
-    firebase_admin.initialize_app(
-        cred,
-        {"databaseURL": firebase_config["databaseURL"]}
-    )
-
-# =====================================================
-# DASHBOARD UI
-# =====================================================
-
-st.set_page_config(page_title="Gas Dashboard", layout="wide")
-
-col_title, col_logout = st.columns([8, 1])
-
-with col_title:
-    st.title("🔥 Gas Sensor Live Dashboard")
-
-with col_logout:
-    if st.button("Logout"):
+# ── Logout button ─────────────────────────────────────────────────────────────
+col1, col2 = st.columns([8, 1])
+with col2:
+    if st.button("🚪 Logout"):
         st.session_state.logged_in = False
         st.rerun()
 
-# =====================================================
-# READ DATA FROM FIREBASE
-# =====================================================
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("🌡️ DHT11 Monitoring Dashboard")
+st_autorefresh(interval=10000, key="autorefresh")
 
-ref = db.reference("gas_history")
-data = ref.get()
+# ── Firebase init ─────────────────────────────────────────────────────────────
+if not firebase_admin._apps:
+    firebase_config = dict(st.secrets["firebase"])
+    cred = credentials.Certificate(firebase_config)
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": firebase_config["databaseURL"]
+    })
 
+# ── Load data ─────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=5)
+def load_data():
+    ref = db.reference("dht_history")
+    return ref.get()
+
+data = load_data()
 if not data:
     st.warning("No data found in Firebase.")
-else:
-    df = pd.DataFrame.from_dict(data, orient="index")
+    st.stop()
 
-    # Convert index to datetime
-    df.index = pd.to_datetime(df.index, format="%Y-%m-%d_%H:%M:%S")
-    df = df.sort_index()
+records = [
+    {"time": k, "temperature": v.get("temperature"), "humidity": v.get("humidity")}
+    for k, v in data.items() if isinstance(v, dict)
+]
 
-    latest_value = df["gas_value"].iloc[-1]
+df = pd.DataFrame(records)
+df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d_%H:%M:%S")
+df = df.sort_values("time")
 
-    col1, col2 = st.columns(2)
+# ── Live metrics ──────────────────────────────────────────────────────────────
+latest = df.iloc[-1]
+col1, col2 = st.columns(2)
+col1.metric("🌡️ Temperature", f"{latest['temperature']} °C")
+col2.metric("💧 Humidity",    f"{latest['humidity']} %")
 
-    with col1:
-        st.metric("Current Gas Value", int(latest_value))
+# ── Sidebar filter ────────────────────────────────────────────────────────────
+st.sidebar.header("📅 Date Filter")
+start = st.sidebar.date_input("Start", df["time"].min().date())
+end   = st.sidebar.date_input("End",   df["time"].max().date())
+df_filtered = df[(df["time"].dt.date >= start) & (df["time"].dt.date <= end)]
 
-    with col2:
-        if latest_value > 1500:
-            st.error("⚠️ Gas Level HIGH!")
-        else:
-            st.success("Gas Level Normal")
+# ── Charts ────────────────────────────────────────────────────────────────────
+fig1 = px.line(df_filtered, x="time", y="temperature",
+               markers=True, title="Temperature Over Time")
+fig1.update_layout(template="plotly_dark")
+st.plotly_chart(fig1, use_container_width=True)
 
-    st.subheader("📊 Gas Level Over Time")
-    st.line_chart(df["gas_value"])
+fig2 = px.line(df_filtered, x="time", y="humidity",
+               markers=True, title="Humidity Over Time")
+fig2.update_layout(template="plotly_dark")
+st.plotly_chart(fig2, use_container_width=True)
 
-    with st.expander("Show Raw Data"):
-        st.dataframe(df)
+# ── Table ─────────────────────────────────────────────────────────────────────
+st.dataframe(df_filtered[["time", "temperature", "humidity"]],
+             use_container_width=True)
 
-# =====================================================
-# AUTO REFRESH EVERY 10 SECONDS
-# =====================================================
-
-time.sleep(10)
-st.rerun()
+# ── CSV export ────────────────────────────────────────────────────────────────
+export = df_filtered.copy()
+export["time"] = export["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+csv = export[["time", "temperature", "humidity"]].to_csv(index=False, sep=";")
+st.download_button("⬇ Download CSV", csv, "dht_data.csv", "text/csv")
+st.caption("🔄 Auto-refreshes every 10 seconds")
